@@ -19,16 +19,24 @@ package core
 import (
 	"fmt"
 	"io"
-	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/consensus/istanbul"
 	"github.com/ethereum/go-ethereum/rlp"
 )
 
 type Engine interface {
-	Start(lastSequence *big.Int, lastProposer common.Address, lastProposal istanbul.Proposal) error
+	Start() error
 	Stop() error
+
+	IsProposer() bool
+
+	// verify if a hash is the same as the proposed block in the current pending request
+	//
+	// this is useful when the engine is currently the proposer
+	//
+	// pending request is populated right at the preprepare stage so this would give us the earliest verification
+	// to avoid any race condition of coming propagated blocks
+	IsCurrentProposal(blockHash common.Hash) bool
 }
 
 type State uint64
@@ -163,35 +171,4 @@ func (m *message) String() string {
 
 func Encode(val interface{}) ([]byte, error) {
 	return rlp.EncodeToBytes(val)
-}
-
-// ----------------------------------------------------------------------------
-
-type roundChange struct {
-	Round    *big.Int
-	Sequence *big.Int
-	Digest   common.Hash
-}
-
-// EncodeRLP serializes rc into the Ethereum RLP format.
-func (rc *roundChange) EncodeRLP(w io.Writer) error {
-	return rlp.Encode(w, []interface{}{
-		rc.Round,
-		rc.Sequence,
-		rc.Digest,
-	})
-}
-
-// DecodeRLP implements rlp.Decoder, and load the consensus fields from a RLP stream.
-func (rc *roundChange) DecodeRLP(s *rlp.Stream) error {
-	var rawRoundChange struct {
-		Round    *big.Int
-		Sequence *big.Int
-		Digest   common.Hash
-	}
-	if err := s.Decode(&rawRoundChange); err != nil {
-		return err
-	}
-	rc.Round, rc.Sequence, rc.Digest = rawRoundChange.Round, rawRoundChange.Sequence, rawRoundChange.Digest
-	return nil
 }

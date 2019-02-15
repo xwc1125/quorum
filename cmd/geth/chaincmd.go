@@ -19,6 +19,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"runtime"
 	"strconv"
@@ -67,6 +68,9 @@ It expects the genesis file as argument.`,
 			utils.DataDirFlag,
 			utils.CacheFlag,
 			utils.LightModeFlag,
+			utils.GCModeFlag,
+			utils.CacheDatabaseFlag,
+			utils.CacheGCFlag,
 		},
 		Category: "BLOCKCHAIN COMMANDS",
 		Description: `
@@ -92,6 +96,34 @@ Requires a first argument of the file to write to.
 Optional second and third arguments control the first and
 last block to write. In this mode, the file will be appended
 if already existing.`,
+	}
+	importPreimagesCommand = cli.Command{
+		Action:    utils.MigrateFlags(importPreimages),
+		Name:      "import-preimages",
+		Usage:     "Import the preimage database from an RLP stream",
+		ArgsUsage: "<datafile>",
+		Flags: []cli.Flag{
+			utils.DataDirFlag,
+			utils.CacheFlag,
+			utils.LightModeFlag,
+		},
+		Category: "BLOCKCHAIN COMMANDS",
+		Description: `
+	The import-preimages command imports hash preimages from an RLP encoded stream.`,
+	}
+	exportPreimagesCommand = cli.Command{
+		Action:    utils.MigrateFlags(exportPreimages),
+		Name:      "export-preimages",
+		Usage:     "Export the preimage database into an RLP stream",
+		ArgsUsage: "<dumpfile>",
+		Flags: []cli.Flag{
+			utils.DataDirFlag,
+			utils.CacheFlag,
+			utils.LightModeFlag,
+		},
+		Category: "BLOCKCHAIN COMMANDS",
+		Description: `
+The export-preimages command export hash preimages to an RLP encoded stream`,
 	}
 	copydbCommand = cli.Command{
 		Action:    utils.MigrateFlags(copyDb),
@@ -140,6 +172,24 @@ Use "ethereum dump 0" to dump the genesis block.`,
 	}
 )
 
+// In the regular Genesis / ChainConfig struct, due to the way go deserializes
+// json, IsQuorum defaults to false (when not specified). Here we specify it as
+// a pointer so we can make the distinction and default unspecified to true.
+func getIsQuorum(file io.Reader) bool {
+	altGenesis := new(struct {
+		Config *struct {
+			IsQuorum *bool `json:"isQuorum"`
+		} `json:"config"`
+	})
+
+	if err := json.NewDecoder(file).Decode(altGenesis); err != nil {
+		utils.Fatalf("invalid genesis file: %v", err)
+	}
+
+	// unspecified defaults to true
+	return altGenesis.Config.IsQuorum == nil || *altGenesis.Config.IsQuorum
+}
+
 // initGenesis will initialise the given JSON format genesis file and writes it as
 // the zero'd block (i.e. genesis) or will fail hard if it can't succeed.
 func initGenesis(ctx *cli.Context) error {
@@ -158,6 +208,10 @@ func initGenesis(ctx *cli.Context) error {
 	if err := json.NewDecoder(file).Decode(genesis); err != nil {
 		utils.Fatalf("invalid genesis file: %v", err)
 	}
+
+	file.Seek(0, 0)
+	genesis.Config.IsQuorum = getIsQuorum(file)
+
 	// Open an initialise both full and light databases
 	stack := makeFullNode(ctx)
 	for _, name := range []string{"chaindata", "lightchaindata"} {
@@ -202,7 +256,7 @@ func importChain(ctx *cli.Context) error {
 
 	if len(ctx.Args()) == 1 {
 		if err := utils.ImportChain(chain, ctx.Args().First()); err != nil {
-			utils.Fatalf("Import error: %v", err)
+			log.Error("Import error", "err", err)
 		}
 	} else {
 		for _, arg := range ctx.Args() {
@@ -211,7 +265,7 @@ func importChain(ctx *cli.Context) error {
 			}
 		}
 	}
-
+	chain.Stop()
 	fmt.Printf("Import done in %v.\n\n", time.Since(start))
 
 	// Output pre-compaction stats mostly to see the import trashing
@@ -222,6 +276,13 @@ func importChain(ctx *cli.Context) error {
 		utils.Fatalf("Failed to read database stats: %v", err)
 	}
 	fmt.Println(stats)
+
+	ioStats, err := db.LDB().GetProperty("leveldb.iostats")
+	if err != nil {
+		utils.Fatalf("Failed to read database iostats: %v", err)
+	}
+	fmt.Println(ioStats)
+
 	fmt.Printf("Trie cache misses:  %d\n", trie.CacheMisses())
 	fmt.Printf("Trie cache unloads: %d\n\n", trie.CacheUnloads())
 
@@ -251,6 +312,12 @@ func importChain(ctx *cli.Context) error {
 		utils.Fatalf("Failed to read database stats: %v", err)
 	}
 	fmt.Println(stats)
+
+	ioStats, err = db.LDB().GetProperty("leveldb.iostats")
+	if err != nil {
+		utils.Fatalf("Failed to read database iostats: %v", err)
+	}
+	fmt.Println(ioStats)
 
 	return nil
 }
@@ -283,7 +350,39 @@ func exportChain(ctx *cli.Context) error {
 	if err != nil {
 		utils.Fatalf("Export error: %v\n", err)
 	}
-	fmt.Printf("Export done in %v", time.Since(start))
+	fmt.Printf("Export done in %v\n", time.Since(start))
+	return nil
+}
+
+// importPreimages imports preimage data from the specified file.
+func importPreimages(ctx *cli.Context) error {
+	if len(ctx.Args()) < 1 {
+		utils.Fatalf("This command requires an argument.")
+	}
+	stack := makeFullNode(ctx)
+	diskdb := utils.MakeChainDatabase(ctx, stack).(*ethdb.LDBDatabase)
+
+	start := time.Now()
+	if err := utils.ImportPreimages(diskdb, ctx.Args().First()); err != nil {
+		utils.Fatalf("Export error: %v\n", err)
+	}
+	fmt.Printf("Export done in %v\n", time.Since(start))
+	return nil
+}
+
+// exportPreimages dumps the preimage data to specified json file in streaming way.
+func exportPreimages(ctx *cli.Context) error {
+	if len(ctx.Args()) < 1 {
+		utils.Fatalf("This command requires an argument.")
+	}
+	stack := makeFullNode(ctx)
+	diskdb := utils.MakeChainDatabase(ctx, stack).(*ethdb.LDBDatabase)
+
+	start := time.Now()
+	if err := utils.ExportPreimages(diskdb, ctx.Args().First()); err != nil {
+		utils.Fatalf("Export error: %v\n", err)
+	}
+	fmt.Printf("Export done in %v\n", time.Since(start))
 	return nil
 }
 
